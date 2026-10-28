@@ -1,0 +1,9 @@
+target/
+.git/
+.github/
+infra/
+lambda-java/
+*.md
+*.zip
+.idea/
+.vscode/

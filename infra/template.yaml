@@ -1,0 +1,215 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Document Service serverless step - S3 bucket, S3-triggered Lambda that marks documents
+  PROCESSED, least-privilege IAM role, and CloudWatch alarms.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: prod
+    AllowedPattern: "^[a-z0-9-]{2,12}$"
+  DocServiceUrl:
+    Type: String
+    Description: Base URL of the Document Service (reachable from Lambda), e.g. https://docs.example.com
+    AllowedPattern: "^https://.+"
+  TokenParameterName:
+    Type: String
+    Default: /docsvc/prod/internal-api-token
+    Description: >
+      SSM Parameter Store SecureString holding the shared secret for /internal endpoints.
+      Create it out-of-band (CloudFormation cannot create SecureString parameters).
+  AlarmEmail:
+    Type: String
+    Default: ""
+    Description: Optional e-mail address subscribed to the alarm topic.
+
+Conditions:
+  HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, ""]]
+
+# The bucket name is built from pseudo parameters (not !Ref Bucket) wherever the Lambda role or
+# the invoke permission needs it. That breaks the Bucket -> Lambda -> Role/Permission -> Bucket
+# dependency cycle that S3 notifications otherwise create.
+Resources:
+  DocumentsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    DependsOn: ProcessorInvokePermission
+    Properties:
+      BucketName: !Sub docsvc-${Environment}-${AWS::AccountId}-${AWS::Region}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt ProcessorFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: uploads/
+
+  DocumentsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DocumentsBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !GetAtt DocumentsBucket.Arn
+              - !Sub ${DocumentsBucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  ProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/docsvc-${Environment}-processor
+      RetentionInDays: 30
+
+  # Least privilege: the function needs no S3 access at all (the event carries key and size).
+  # It may only write to its own log group and read one SSM parameter.
+  ProcessorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub docsvc-${Environment}-processor-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: processor-least-privilege
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: WriteOwnLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub ${ProcessorLogGroup.Arn}:*
+              - Sid: ReadInternalApiToken
+                Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${TokenParameterName}
+              # Only needed if the parameter is encrypted with a customer-managed KMS key; the default
+              # aws/ssm key needs no explicit kms:Decrypt grant.
+
+  ProcessorFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: ProcessorLogGroup
+    Properties:
+      FunctionName: !Sub docsvc-${Environment}-processor
+      Description: Marks documents PROCESSED after an S3 upload
+      Runtime: java21
+      Handler: com.example.processor.S3EventHandler::handleRequest
+      Code: ../lambda-java/target/processor.jar # replaced with an S3 location by `aws cloudformation package`
+      Role: !GetAtt ProcessorRole.Arn
+      Timeout: 30
+      MemorySize: 512 # Java needs more memory than Python for acceptable cold starts
+      Environment:
+        Variables:
+          DOC_SERVICE_URL: !Ref DocServiceUrl
+          TOKEN_PARAMETER_NAME: !Ref TokenParameterName
+
+  # Async invocations (how S3 calls Lambda): retry twice, then drop after 1 hour.
+  ProcessorInvokeConfig:
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      FunctionName: !Ref ProcessorFunction
+      Qualifier: $LATEST
+      MaximumRetryAttempts: 2
+      MaximumEventAgeInSeconds: 3600
+
+  ProcessorInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ProcessorFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub arn:${AWS::Partition}:s3:::docsvc-${Environment}-${AWS::AccountId}-${AWS::Region}
+
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub docsvc-${Environment}-alarms
+
+  AlarmEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlarmEmail
+    Properties:
+      TopicArn: !Ref AlarmTopic
+      Protocol: email
+      Endpoint: !Ref AlarmEmail
+
+  ProcessorErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub docsvc-${Environment}-processor-errors
+      AlarmDescription: Processor Lambda failed (service unreachable, bad token, unknown key...).
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ProcessorFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopic
+      OKActions:
+        - !Ref AlarmTopic
+
+  ProcessorThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub docsvc-${Environment}-processor-throttles
+      AlarmDescription: Processor Lambda invocations are being throttled.
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ProcessorFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopic
+
+Outputs:
+  BucketName:
+    Value: !Ref DocumentsBucket
+    Description: Set as DOCS_BUCKET for the Document Service
+  FunctionArn:
+    Value: !GetAtt ProcessorFunction.Arn
+  AlarmTopicArn:
+    Value: !Ref AlarmTopic

@@ -1,0 +1,36 @@
+spring:
+  application:
+    name: document-service
+  datasource:
+    # Defaults to in-memory H2 so the service starts with zero setup.
+    # Deployed environments override with e.g. jdbc:postgresql://host:5432/docs
+    url: ${DB_URL:jdbc:h2:mem:docs;DB_CLOSE_DELAY=-1}
+    username: ${DB_USER:sa}
+    password: ${DB_PASSWORD:}
+  jpa:
+    open-in-view: false
+    hibernate:
+      # "update" keeps the exercise self-contained; use Flyway/Liquibase + "validate" in production.
+      ddl-auto: ${DDL_AUTO:update}
+
+server:
+  port: ${PORT:8080}
+  shutdown: graceful
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
+
+app:
+  aws:
+    region: ${AWS_REGION:ap-south-1}
+    s3:
+      bucket: ${DOCS_BUCKET:docsvc-documents-local}
+      # Set to e.g. http://localhost:4566 to use LocalStack. Empty = real AWS.
+      endpoint-override: ${S3_ENDPOINT:}
+      presign-ttl: ${PRESIGN_TTL:PT15M}
+  # Shared secret the S3-triggered Lambda sends to /internal/** endpoints.
+  # Blank disables the internal endpoint entirely (fail closed).
+  internal-api-token: ${INTERNAL_API_TOKEN:}

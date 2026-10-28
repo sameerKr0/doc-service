@@ -1,0 +1,10 @@
+target/
+packaged.yaml
+__pycache__/
+*.pyc
+.idea/
+.vscode/
+*.iml
+.DS_Store
+
+lambda-java/target/

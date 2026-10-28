@@ -1,0 +1,120 @@
+name: ci-cd
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Least privilege by default; the deploy job opts in to id-token below.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-cd-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build-test:
+    name: Build and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      - name: Document service - build + JUnit/Mockito tests
+        run: mvn -B -ntp verify
+
+      - name: Processor Lambda (Java) - build + JUnit/Mockito tests
+        run: mvn -B -ntp -f lambda-java/pom.xml verify
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Validate CloudFormation templates
+        run: |
+          pip install --quiet cfn-lint
+          # `Code: ../lambda-java/...jar` is a local path that `aws cloudformation package` rewrites
+          # at deploy time; swap in a placeholder so the linter sees a valid Code object.
+          sed 's#^\( *\)Code: ../lambda-java/.*#\1Code: {ZipFile: "placeholder"}#' infra/template.yaml > "$RUNNER_TEMP/template-lint.yaml"
+          cfn-lint --non-zero-exit-code error "$RUNNER_TEMP/template-lint.yaml" infra/bootstrap.yaml
+
+      - name: Build Docker image (no push on PRs)
+        run: docker build -t document-service:${{ github.sha }} .
+
+  deploy:
+    name: Push image and deploy to AWS
+    needs: build-test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      id-token: write # lets the job request a GitHub OIDC token - no AWS keys are stored anywhere
+      contents: read
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-${{ github.run_id }}
+
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push image (tagged with commit SHA)
+        run: |
+          IMAGE="${{ steps.ecr.outputs.registry }}/${ECR_REPOSITORY}:${{ github.sha }}"
+          docker build -t "$IMAGE" .
+          docker push "$IMAGE"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      - name: Build Lambda jar (tests already passed in build-test)
+        run: mvn -B -ntp -f lambda-java/pom.xml -DskipTests package
+
+      - name: Package Lambda code
+        run: |
+          aws cloudformation package \
+            --template-file infra/template.yaml \
+            --s3-bucket "${{ vars.ARTIFACT_BUCKET }}" \
+            --s3-prefix lambda \
+            --output-template-file packaged.yaml
+
+      - name: Deploy serverless stack (S3 + Lambda + IAM + alarms)
+        run: |
+          aws cloudformation deploy \
+            --template-file packaged.yaml \
+            --stack-name docsvc-app-prod \
+            --role-arn "${{ vars.CFN_EXECUTION_ROLE_ARN }}" \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --no-fail-on-empty-changeset \
+            --parameter-overrides \
+              Environment=prod \
+              DocServiceUrl="${{ vars.DOC_SERVICE_URL }}" \
+              AlarmEmail="${{ vars.ALARM_EMAIL }}"
+
+      - name: Summary
+        run: |
+          {
+            echo "### Deployed"
+            echo "- Image: \`$IMAGE\`"
+            echo "- Stack: \`docsvc-app-prod\`"
+          } >> "$GITHUB_STEP_SUMMARY"
