@@ -41,8 +41,8 @@ jobs:
         run: |
           pip install --quiet cfn-lint
           # `Code: ../lambda-java/...jar` is a local path that `aws cloudformation package` rewrites
-          # at deploy time; swap in a placeholder so the linter sees a valid Code object.
-          sed 's#^\( *\)Code: ../lambda-java/.*#\1Code: {ZipFile: "placeholder"}#' infra/template.yaml > "$RUNNER_TEMP/template-lint.yaml"
+          # at deploy time; swap in an S3 placeholder (ZipFile is not valid for Java runtimes) so the linter sees a valid Code object.
+          sed 's#^\( *\)Code: ../lambda-java/.*#\1Code: {S3Bucket: placeholder-bucket, S3Key: placeholder.jar}#' infra/template.yaml > "$RUNNER_TEMP/template-lint.yaml"
           cfn-lint --non-zero-exit-code error "$RUNNER_TEMP/template-lint.yaml" infra/bootstrap.yaml
 
       - name: Build Docker image (no push on PRs)
@@ -51,7 +51,9 @@ jobs:
   deploy:
     name: Push image and deploy to AWS
     needs: build-test
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # Runs only on main AND only once the AWS bootstrap has been done (AWS_DEPLOY_ROLE_ARN repo
+    # variable set). Without it the job is skipped instead of failing.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.AWS_DEPLOY_ROLE_ARN != ''
     runs-on: ubuntu-latest
     environment: production
     permissions:
