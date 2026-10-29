@@ -74,6 +74,8 @@ Configuration (env vars): `DB_URL`, `DB_USER`, `DB_PASSWORD` (use PostgreSQL whe
 
 ## Deploying
 
+**Status:** the infrastructure templates and the pipeline are written but have not been deployed to a real AWS account (none was available). The CI part (build and tests) runs on GitHub and is green; the deploy stage has not been run.
+
 One-time, with admin credentials:
 
 ```bash
@@ -139,6 +141,6 @@ In short: because Lambda and S3 are managed, AWS's share is larger there than it
 ## AI tools used
 
 - **Claude (Anthropic)** was used to generate the first drafts of **all** artefacts in this repository: the Spring Boot code, unit tests, Lambda function and its tests, both CloudFormation templates, the GitHub Actions workflow, the Dockerfile, and this README (including the Shared Responsibility section).
-- Verified in the authoring environment: the YAML files parse and template cross-references resolve; the Java sources were syntax-checked.
-- **Not run in that environment:** `mvn verify` for either Maven project (Maven Central was unreachable), Docker build, `cfn-lint`, and any real AWS deployment.
-- Author's own review/run status: _to be completed by the author before submission_.
+- Verified by the author: `mvn verify` on both Maven projects passes locally (service and Lambda), and the GitHub Actions CI run (build, tests, Docker build, template validation) is green.
+- **Not run:** any real AWS deployment (no AWS account was available).
+- Author's own review/run status: I ran both builds locally (all tests passed), fixed a failing Lambda test, reviewed the code, and confirmed the CI pipeline is green on GitHub. The AWS deployment stage was not run because I do not have an AWS account.
